@@ -335,3 +335,121 @@ test('广场页内作者视角：自己的条目显示下架按钮，点击后�
   assert.ok(!$('plaza-list').innerHTML.includes('我的发布'), '下架后从广场列表消失');
   assert.ok($('plaza-list').innerHTML.includes('校园日常'), '其他条目不受影响');
 });
+
+test('跨来源判重：名称与候选词已在本机（如来自分享码导入）时不再给订阅入口', () => {
+  $('btn-packs-home').onclick();
+  const n0 = storedPacks().length;
+  // 通过分享码导入了一个词包（内容与广场条目完全相同，但没有 plazaId）
+  recvMsg({ type: 'sharedPack', code: 'XXXX4444',
+    pack: { id: 'pk_xsrc_dedup', name: '跨源同内容包', theme: '专属主题',
+      words: ['词甲', '词乙', '词丙', '词丁'] } });
+  assert.strictEqual(storedPacks().length, n0 + 1);
+  // 广场上有同内容条目（不同 id）：应显示「已在本机」而不是订阅按钮
+  const crossItem = { id: 'pz_cdedup0000aa', name: '跨源同内容包', theme: '专属主题', wordCount: 4,
+    words: ['词甲', '词乙', '词丙', '词丁'], author: '路人', subscribers: 9,
+    publishedAt: 1, updatedAt: 2, mine: false };
+  $('btn-plaza-home').onclick();
+  recvMsg({ type: 'plazaList', sort: 'hot', packs: [crossItem] });
+  assert.ok($('plaza-list').innerHTML.includes('已在本机'), '跨来源同内容显示已在本机');
+  assert.strictEqual($('plaza-list').querySelectorAll('[data-plaza-sub]').length, 0, '无订阅按钮');
+});
+
+test('编辑订阅来的词包后 plazaId 保留，同一广场条目不会被重复订阅成第二份', () => {
+  $('btn-plaza-home').onclick();
+  const listPack = { ...PLAZA_LIST[0], id: 'pz_ed17000001aa', name: '编辑保源包' };
+  recvMsg({ type: 'plazaList', sort: 'hot', packs: [listPack] });
+  $('plaza-list').querySelectorAll('[data-plaza-sub]')
+    .find(b => b.dataset.plazaSub === 'pz_ed17000001aa').onclick();
+  recvMsg({ type: 'plazaPack', id: 'pz_ed17000001aa', subscribers: 1,
+    pack: { id: 'pk_editkeep', name: '编辑保源包', theme: '与海有关',
+      words: ['海浪', '贝壳', '灯塔', '海鸥'] } });
+  const local = storedPacks().find(p => p.plazaId === 'pz_ed17000001aa');
+  assert.ok(local);
+
+  // 编辑这个词包
+  $('btn-packs-home').onclick();
+  $('pack-list').querySelectorAll('[data-pack-edit]')
+    .find(b => b.dataset.packEdit === local.id).onclick();
+  $('pack-name').value = '编辑保源包改';
+  $('btn-pack-save').onclick();
+  const edited = storedPacks().find(p => p.id === local.id);
+  assert.strictEqual(edited.plazaId, 'pz_ed17000001aa', '编辑后 plazaId 保留');
+
+  // 再收到一次同一条目的订阅响应：按 plazaId 去重，不产生第二份
+  recvMsg({ type: 'plazaList', sort: 'hot', packs: [
+    { ...listPack, name: '编辑保源包改', words: edited.words },
+  ] });
+  recvMsg({ type: 'plazaPack', id: 'pz_ed17000001aa', subscribers: 1,
+    pack: { id: 'pk_editkeep', name: '编辑保源包改', theme: '与海有关', words: edited.words } });
+  assert.strictEqual(storedPacks().filter(p => p.plazaId === 'pz_ed17000001aa').length, 1);
+});
+
+test('跨设备认领：订阅自己在另一台设备上发布的词包，myPlaza 对账后认领回稳定 packId', () => {
+  $('btn-plaza-home').onclick();
+  const n0 = storedPacks().length;
+  const listPack = { ...PLAZA_LIST[2], id: 'pz_ad0c000001aa', name: '跨设备山野包' };
+  recvMsg({ type: 'plazaList', sort: 'hot', packs: [listPack] });
+  // 订阅该条目（实际就是自己发布的）：本机副本带 plazaId
+  $('plaza-list').querySelectorAll('[data-plaza-sub]')
+    .find(b => b.dataset.plazaSub === 'pz_ad0c000001aa').onclick();
+  recvMsg({ type: 'plazaPack', id: 'pz_ad0c000001aa', subscribers: 0,
+    pack: { id: 'pk_ad0c_pack', name: '跨设备山野包', theme: '', words: ['山峰', '山谷', '溪流'] } });
+  const local = storedPacks().find(p => p.plazaId === 'pz_ad0c000001aa');
+  assert.ok(local);
+
+  // myPlaza 对账：该条目就是当前身份在另一台设备上发布的
+  $('btn-packs-home').onclick();
+  recvMsg({ type: 'myPlaza', packs: [
+    { id: 'pz_ad0c000001aa', packId: 'pk_ad0c_pack', name: '跨设备山野包', subscribers: 0, updatedAt: 600 },
+  ] });
+  const adopted = storedPacks().find(p => p.id === 'pk_ad0c_pack');
+  assert.ok(adopted, '本机副本 id 被认领回作者稳定 packId');
+  assert.ok(!adopted.plazaId, '订阅标记退场');
+  assert.strictEqual(storedPacks().length, n0 + 1);
+  // 词包行按我的发布映射显示徽标与更新/下架入口
+  assert.ok($('pack-list').innerHTML.includes('已发布到广场'));
+  // 不再出现在「其他设备上发布」孤儿区
+  assert.ok($('plaza-orphans')._cls.has('hidden'));
+});
+
+test('跨设备更新发布：订阅来的副本点更新时带原条目 id，服务端沿用同一条目不分裂', () => {
+  $('btn-packs-home').onclick();
+  storage.wt_plaza_mine = JSON.stringify([
+    { id: 'pz_abcd000001aa', packId: 'pk_repub_author', name: '跨设备更新包', updatedAt: 100 },
+  ]);
+  storage.wt_packs = JSON.stringify([
+    { id: 'pk_repub_copy', name: '跨设备更新包', theme: '与海有关',
+      words: ['海浪', '贝壳', '灯塔', '海鸥'],
+      plazaId: 'pz_abcd000001aa', subscribedAt: 50, updatedAt: 60 },
+  ]);
+  $('btn-packs-home').onclick();
+  // myPlaza 对账先触发认领（pk_repub_copy → pk_repub_author）
+  recvMsg({ type: 'myPlaza', packs: [
+    { id: 'pz_abcd000001aa', packId: 'pk_repub_author', name: '跨设备更新包', subscribers: 1, updatedAt: 100 },
+  ] });
+  assert.ok(storedPacks().some(p => p.id === 'pk_repub_author'));
+
+  // 点「更新发布」：应带条目 id 提示（此时词包已认领，按 packId 也能命中原条目）
+  const pubBtn = $('pack-list').querySelectorAll('[data-pack-pub]')
+    .find(b => b.dataset.packPub === 'pk_repub_author');
+  assert.ok(pubBtn);
+  pubBtn.onclick();
+  const m = sentMsgs.filter(x => x.type === 'plazaPublish');
+  assert.strictEqual(m.at(-1).id, 'pz_abcd000001aa', '更新发布带上原条目 id 提示');
+  assert.strictEqual(m.at(-1).pack.id, 'pk_repub_author');
+});
+
+test('下架失败（别的设备已先下架）后重新对账，本机残留条目消失', () => {
+  $('btn-packs-home').onclick();
+  recvMsg({ type: 'myPlaza', packs: [
+    { id: 'pz_abcd000002bb', packId: 'pk_unpubfail', name: '待对账下架包', subscribers: 1, updatedAt: 100 },
+  ] });
+  assert.ok(!$('plaza-orphans')._cls.has('hidden'));
+  // 服务端报「没有这个词包/不是发布者」：客户端应重新拉取 myPlaza
+  const before = sentMsgs.filter(m => m.type === 'myPlaza').length;
+  recvMsg({ type: 'error', context: 'plazaUnpublish', message: '广场上没有这个词包，或你不是发布者' });
+  assert.ok(sentMsgs.filter(m => m.type === 'myPlaza').length > before, '失败后重新对账');
+  // 对账结果为空：孤儿区清空
+  recvMsg({ type: 'myPlaza', packs: [] });
+  assert.ok($('plaza-orphans')._cls.has('hidden'));
+});

@@ -107,9 +107,13 @@
   // 发布/更新一个本机词包到广场：
   //  - 该作者已发布过同一 packId（再次点发布/编辑后更新）：沿用原条目、覆盖快照，
   //    订阅数与发布时间保留；
+  //  - opts.id 指定了本人持有的有效广场条目（典型场景：另一台设备上从广场订阅了
+  //    自己发布的词包，本机副本 id 是新生成的；更新发布时带上该条目 id，服务端覆盖
+  //    这个条目、不改 packId，两台设备共用同一条目而不是再分裂出第二条）：
+  //    条目不存在/不属于本人时忽略该提示按常规发布处理（绝不允许借提示覆盖别人的条目）；
   //  - 否则新建条目（generate 由服务端注入，基于 crypto 随机并保证不撞 id），
   //    超过每人上限时拒绝。
-  // 返回 { id, republished, updatedAt } 或 { error }。
+  // 返回 { id, packId, republished, updatedAt } 或 { error }。
   function publish(store, opts) {
     const pid = String(opts.pid || '');
     if (!isValidPid(pid)) return { error: '需要有效的本机身份才能发布' };
@@ -119,14 +123,27 @@
     if (!pack) return { error: '词包数据无效' };
     const author = cleanAuthor(opts.author);
     const now = Math.trunc(opts.now || Date.now());
+    // 1) 同一 (pid, packId) 已发布：沿用原条目覆盖
     for (const e of Object.values(store.packs)) {
       if (e.pid === pid && e.packId === packId) {
         e.pack = pack;
         e.author = author;
         e.updatedAt = now;
-        return { id: e.id, republished: true, updatedAt: now, error: null };
+        return { id: e.id, packId: e.packId, republished: true, updatedAt: now, error: null };
       }
     }
+    // 2) 调用方明确指定更新本人已有的某个条目：覆盖快照并保留该条目原 packId/订阅数
+    const hinted = String(opts.id || '');
+    if (isValidPlazaId(hinted)) {
+      const target = store.packs[hinted];
+      if (target && target.pid === pid) {
+        target.pack = pack;
+        target.author = author;
+        target.updatedAt = now;
+        return { id: target.id, packId: target.packId, republished: true, updatedAt: now, error: null };
+      }
+    }
+    // 3) 全新发布
     if (countByOwner(store, pid) >= MAX_PLAZA_PER_OWNER) {
       return { error: `最多同时在广场发布 ${MAX_PLAZA_PER_OWNER} 个词包，请先下架一些` };
     }
@@ -137,7 +154,7 @@
         id, pid, packId, author, pack,
         subs: {}, publishedAt: now, updatedAt: now,
       };
-      return { id, republished: false, updatedAt: now, error: null };
+      return { id, packId, republished: false, updatedAt: now, error: null };
     }
     return { error: '发布失败，请重试' };
   }
@@ -156,12 +173,14 @@
   }
 
   // 订阅：返回词包快照供客户端存进本机词包；同一身份只计一次热度，
-  // 无有效身份的订阅不计数（仍能拿到词包）。返回 { id, packId, pack, subscribers, counted } 或 { error }。
+  // 无有效身份的订阅不计数（仍能拿到词包）；作者本人订阅自己的发布不计数
+  // （发布即代表拥有，自己订阅不应抬高热度，也不影响任何人拿到词包）。
+  // 返回 { id, packId, pack, subscribers, counted } 或 { error }。
   function subscribe(store, id, pid, now) {
     const e = store.packs[String(id || '')];
     if (!e) return { error: '这个词包不存在或已被作者下架' };
     const base = { id: e.id, packId: e.packId, pack: e.pack, error: null };
-    if (!isValidPid(pid) || pid in e.subs) {
+    if (!isValidPid(pid) || pid === e.pid || pid in e.subs) {
       return { ...base, subscribers: subscriberCount(e), counted: false };
     }
     if (subscriberCount(e) >= MAX_SUBS_TRACKED) {

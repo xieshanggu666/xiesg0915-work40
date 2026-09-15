@@ -112,9 +112,13 @@
 
   // 作者发布/更新一个本机词包的分享：
   //  - 该作者已分享过同一 packId（同一词包再次点分享/编辑后更新）：沿用原码、覆盖快照；
+  //  - opts.code 指定了本人持有的有效码（典型场景：另一台设备上导入了自己分享的词包，
+  //    本机副本 id 是新生成的；更新分享时带上该码，服务端覆盖这个码的快照、不改 packId，
+  //    从而两台设备共用同一个码，而不是再分裂出第二个码）：
+  //    码不存在/不属于本人时忽略该提示按常规发布处理（绝不允许借提示覆盖别人的码）；
   //  - 否则生成一个新码（generate 由服务端注入，基于 crypto 随机并保证不撞码），
   //    超过每人上限时拒绝。
-  // 返回 { code, updated, updatedAt } 或 { error }。
+  // 返回 { code, packId, updated, updatedAt } 或 { error }。
   function publishForPack(store, opts) {
     const pid = String(opts.pid || '');
     const packId = String(opts.packId || '');
@@ -123,13 +127,27 @@
     if (!packId || packId.length > MAX_PACK_ID_LEN) return { error: '词包数据无效' };
     if (!pack) return { error: '词包数据无效' };
     const now = Math.trunc(opts.now || Date.now());
+    // 1) 同一 (pid, packId) 已分享：沿用原码覆盖（含罕见竞态——码提示与 packId 提示各命中一条）
     for (const e of Object.values(store.shares)) {
       if (e.pid === pid && e.packId === packId) {
         const r = publish(store, { code: e.code, pid, packId, pack, now });
         if (r.error) return { error: r.error };
-        return { code: e.code, updated: true, updatedAt: r.updatedAt, error: null };
+        return { code: e.code, packId: e.packId, updated: true, updatedAt: r.updatedAt, error: null };
       }
     }
+    // 2) 调用方（客户端）明确指定更新本人已有的某个码：覆盖快照并保留该码原 packId
+    const hinted = normalizeCode(opts.code);
+    if (isValidCode(hinted)) {
+      const target = store.shares[hinted];
+      if (target && target.pid === pid) {
+        const r = publish(store, {
+          code: hinted, pid, packId: target.packId, pack, now,
+        });
+        if (r.error) return { error: r.error };
+        return { code: hinted, packId: target.packId, updated: true, updatedAt: r.updatedAt, error: null };
+      }
+    }
+    // 3) 全新分享
     if (countByOwner(store, pid) >= MAX_SHARES_PER_OWNER) {
       return { error: `最多同时分享 ${MAX_SHARES_PER_OWNER} 个词包，请先取消一些分享` };
     }
@@ -137,7 +155,7 @@
       const code = normalizeCode(typeof opts.generate === 'function' ? opts.generate() : '');
       if (!isValidCode(code) || store.shares[code]) continue;
       const r = publish(store, { code, pid, packId, pack, now });
-      if (!r.error) return { code, updated: false, updatedAt: r.updatedAt, error: null };
+      if (!r.error) return { code, packId, updated: false, updatedAt: r.updatedAt, error: null };
     }
     return { error: '生成分享码失败，请重试' };
   }

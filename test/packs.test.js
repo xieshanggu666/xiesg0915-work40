@@ -87,3 +87,77 @@ test('remove / find：按 id 删除与查找', () => {
   assert.deepStrictEqual(left.map(p => p.id), ['b']);
   assert.strictEqual(packs.length, 2, 'remove 不修改原数组');
 });
+
+test('withPreservedProvenance：编辑导入/订阅来的词包时保留来源标记，新建不继承', () => {
+  const packs = [
+    { id: 'a', name: '甲', theme: '', words: ['甲', '乙', '丙'],
+      importedFrom: 'pk_orig', importedAt: 11 },
+    { id: 'b', name: '乙', theme: '', words: ['一', '二', '三'],
+      plazaId: 'pz_aaaaaaaaaaaa', subscribedAt: 22 },
+  ];
+  // 编辑导入副本：importedFrom/importedAt 必须保留（否则同一来源可被再次导入成重复副本）
+  const editedA = P.withPreservedProvenance(packs,
+    { id: 'a', name: '甲改', theme: '海', words: ['甲', '乙', '丁'], updatedAt: 33 });
+  assert.strictEqual(editedA.importedFrom, 'pk_orig');
+  assert.strictEqual(editedA.importedAt, 11);
+  assert.strictEqual(editedA.name, '甲改');
+  // 编辑订阅副本：plazaId/subscribedAt 保留
+  const editedB = P.withPreservedProvenance(packs,
+    { id: 'b', name: '乙改', theme: '', words: ['一', '二', '四'], updatedAt: 44 });
+  assert.strictEqual(editedB.plazaId, 'pz_aaaaaaaaaaaa');
+  assert.strictEqual(editedB.subscribedAt, 22);
+  // 新建（旧列表里无此 id）：不继承任何来源标记
+  const created = P.withPreservedProvenance(packs,
+    { id: 'c', name: '丙', theme: '', words: ['X', 'Y', 'Z'] });
+  assert.deepStrictEqual(Object.keys(created).sort(), ['id', 'name', 'theme', 'words']);
+});
+
+test('adoptRemotePack(share)：导入自己的分享后认领回稳定 packId，幂等且不覆盖真身', () => {
+  // 本机副本带 importedFrom，指向作者原始 packId
+  const packs = [
+    { id: 'pk_local', name: '甲', theme: '', words: ['甲', '乙', '丙'],
+      importedFrom: 'pk_orig', importedAt: 11 },
+  ];
+  const r1 = P.adoptRemotePack(packs, 'share', { matchId: 'pk_orig', targetId: 'pk_orig' });
+  assert.strictEqual(r1.changed, true);
+  assert.strictEqual(r1.adoptedId, 'pk_orig');
+  const adopted = r1.packs[0];
+  assert.strictEqual(adopted.id, 'pk_orig', '本机副本 id 改写为来源稳定 id');
+  assert.ok(!('importedFrom' in adopted), '认领后不再是导入副本（对自己可重复导入去重）');
+  assert.ok(!('importedAt' in adopted));
+  // 幂等：再认领一次不变化
+  const r2 = P.adoptRemotePack(r1.packs, 'share', { matchId: 'pk_orig', targetId: 'pk_orig' });
+  assert.strictEqual(r2.changed, false);
+  assert.strictEqual(r2.adoptedId, 'pk_orig');
+
+  // 本机已存在 id===targetId 的真身时不改写（避免覆盖）
+  const both = [
+    { id: 'pk_orig', name: '真身', theme: '', words: ['甲', '乙', '丙'] },
+    { id: 'pk_local', name: '副本', theme: '', words: ['甲', '乙', '丙'],
+      importedFrom: 'pk_orig', importedAt: 11 },
+  ];
+  const r3 = P.adoptRemotePack(both, 'share', { matchId: 'pk_orig', targetId: 'pk_orig' });
+  assert.strictEqual(r3.changed, false);
+  assert.deepStrictEqual(r3.packs.map(p => p.id), ['pk_orig', 'pk_local'], '真身与副本并存时不改写');
+  // 无匹配来源：不变化
+  const r4 = P.adoptRemotePack(packs, 'share', { matchId: 'pk_none', targetId: 'pk_none' });
+  assert.strictEqual(r4.changed, false);
+  assert.strictEqual(r4.adoptedId, null);
+});
+
+test('adoptRemotePack(plaza)：按广场条目 id 匹配，id 改写为作者稳定 packId 并清订阅标记', () => {
+  const packs = [
+    { id: 'pk_local', name: '甲', theme: '', words: ['甲', '乙', '丙'],
+      plazaId: 'pz_aaaaaaaaaaaa', subscribedAt: 55 },
+  ];
+  const r = P.adoptRemotePack(packs, 'plaza',
+    { matchId: 'pz_aaaaaaaaaaaa', targetId: 'pk_author' });
+  assert.strictEqual(r.changed, true);
+  assert.strictEqual(r.packs[0].id, 'pk_author', 'id 改写为作者 packId（与我的发布映射对上）');
+  assert.ok(!('plazaId' in r.packs[0]), '订阅标记退场');
+  assert.ok(!('subscribedAt' in r.packs[0]));
+  // 幂等
+  const r2 = P.adoptRemotePack(r.packs, 'plaza',
+    { matchId: 'pz_aaaaaaaaaaaa', targetId: 'pk_author' });
+  assert.strictEqual(r2.changed, false);
+});

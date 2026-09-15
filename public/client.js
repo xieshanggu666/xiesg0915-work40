@@ -228,6 +228,8 @@
         else if (msg.context === 'sharePack') onShareError(msg.message);
         else if (msg.context === 'unsharePack') onUnshareError(msg.message);
         else if (msg.context === 'importShare') onImportError(msg.message);
+        else if (msg.context === 'plazaUnpublish') onPlazaUnpublishError(msg.message);
+        else if (msg.context === 'plazaPublish' || msg.context === 'plazaSubscribe') toast(msg.message);
         else if (msg.context === 'tournament') Tour.onError(msg.message);
         else toast(msg.message);
         if (msg.message.includes('会话已失效') || msg.message.includes('房间已不存在')) {
@@ -1831,8 +1833,36 @@
     if (!$('screen-packs').classList.contains('hidden')) renderPacks();
   }
 
+  // 跨设备认领：服务端列表里每条「我的分享/发布」都带作者原始 packId；本机若有一份
+  // 从该来源导入/订阅来的副本（importedFrom/plazaId 标记），说明它就是同一身份在另一台
+  // 设备上发布的同一个词包——把本机副本的 id 改写回稳定 packId，使徽标/更新/取消合流，
+  // 跨设备区里不再残留「本机有副本却显示成孤儿」的错位。对所有映射幂等，重复对账无副作用。
+  // 返回认领的数量；是否提示由调用方决定（导入/订阅流程本身已有 toast，避免叠两条）。
+  function healAdoptedPacks() {
+    let packs = store.packs;
+    let adopted = 0;
+    for (const s of store.packShares) {
+      if (!s.packId) continue;
+      const r = WTPacks.adoptRemotePack(packs, 'share', { matchId: s.packId, targetId: s.packId });
+      if (r.changed) adopted += 1;
+      packs = r.packs;
+    }
+    const plazaLib = globalThis.WTPlaza;
+    if (plazaLib) {
+      for (const m of store.plazaMine) {
+        if (!m.packId || !m.id) continue;
+        const r = WTPacks.adoptRemotePack(packs, 'plaza', { matchId: m.id, targetId: m.packId });
+        if (r.changed) adopted += 1;
+        packs = r.packs;
+      }
+    }
+    if (adopted) store.packs = packs;
+    return adopted;
+  }
+
   function onMyShares(remote) {
     store.packShares = WTShares.reconcileLocal(store.packShares, remote);
+    if (healAdoptedPacks()) toast('已把另一台设备上的词包认领回本机');
     renderPacks();
   }
 
@@ -1845,7 +1875,11 @@
     $('pack-empty').classList.toggle('hidden', packs.length > 0);
     $('pack-list').innerHTML = packs.map(p => {
       const sh = WTShares.findLocalByPackId(myShares, p.id);
-      const pub = plazaLib ? plazaLib.findLocalByPackId(myPlaza, p.id) : null;
+      // 广场徽标按本机映射的「条目 id」匹配（认领回自己的发布后，词包 id 已等于作者 packId）；
+      // 兼容历史：订阅副本（已删除映射的老数据）仍带 plazaId，也能显示徽标
+      const pub = plazaLib
+        ? (plazaLib.findLocalByPackId(myPlaza, p.id) || myPlaza.find(m => m.id === p.plazaId) || null)
+        : null;
       return `
       <li>
         <div>
@@ -1886,7 +1920,8 @@
         const p = WTPacks.find(store.packs, btn.dataset.packDel);
         if (!p) return;
         const shared = !!WTShares.findLocalByPackId(store.packShares, p.id);
-        const published = !!(plazaLib && plazaLib.findLocalByPackId(store.plazaMine, p.id));
+        const published = !!(plazaLib && (plazaLib.findLocalByPackId(store.plazaMine, p.id) ||
+          store.plazaMine.find(m => m.id === p.plazaId)));
         const extra = [
           shared ? '\n该词包的分享仍对朋友有效，可在页面下方「其他设备上分享的词包」中取消。' : '',
           published ? '\n该词包仍在交流广场上，可在页面下方「其他设备上发布的词包」中下架。' : '',
@@ -1940,24 +1975,54 @@
     shareCurrentPack(p);
   }
 
+  // 若本机词包是从自己的分享码导入的副本（跨设备场景），找出它对应的有效码：
+  // 更新分享时带上该码，服务端覆盖同一条分享而不是再发一个新码。
+  // 认领回稳定 id 后，本机映射已直接按 packId 对上，优先按 packId 找。
+  function ownShareCodeForPack(p) {
+    if (!p) return '';
+    const byPackId = WTShares.findLocalByPackId(store.packShares, p.id);
+    if (byPackId) return byPackId.code;
+    if (p.importedFrom) {
+      const m = WTShares.findLocalByPackId(store.packShares, p.importedFrom);
+      if (m) return m.code;
+    }
+    return '';
+  }
+
   function shareCurrentPack(p) {
     // 离线时 send 会统一提示"正在重连"，这里不额外弹"正在生成"，避免两条矛盾提示
     if (!send({
       type: 'sharePack', pidSecret: store.pidSecret,
       pack: { id: p.id, name: p.name, theme: p.theme, words: p.words },
+      code: ownShareCodeForPack(p) || undefined,
     })) return;
     toast('正在生成分享码…');
   }
 
   // 服务端确认分享成功（新建或更新）：记下本机映射，弹窗展示码。
+  // 码提示更新（跨设备）时服务端返回的 packId 是该码原有的稳定 id，可能与本机新副本
+  // id 不同：本机映射记到稳定 id，并把本机副本认领/对齐到该 id，两边重新合流。
   function onPackShared(msg) {
     const code = WTShares.normalizeCode(msg.code);
     if (!WTShares.isValidCode(code)) return;
+    const serverPackId = String(msg.packId || '');
     store.packShares = WTShares.upsertLocal(store.packShares,
-      { code, packId: msg.packId, name: msg.name, updatedAt: msg.updatedAt || Date.now() });
+      { code, packId: serverPackId, name: msg.name, updatedAt: msg.updatedAt || Date.now() });
+    // 触发分享的本机词包（按当前列表找到的原始 id 与服务端稳定 id 不一致时）认领回来
+    if (serverPackId) {
+      const local = WTPacks.find(store.packs, serverPackId);
+      if (!local) {
+        const byImport = store.packs.find(p => p.importedFrom === serverPackId);
+        if (byImport) {
+          const r = WTPacks.adoptRemotePack(store.packs, 'share',
+            { matchId: serverPackId, targetId: serverPackId });
+          if (r.changed) store.packs = r.packs;
+        }
+      }
+    }
     if (msg.republished) toast('分享内容已更新，朋友导入的始终是最新版本');
     // 仅当用户仍停留在词包页时弹窗，避免响应到达瞬间已切页而弹窗叠在别的页面上
-    const p = WTPacks.find(store.packs, msg.packId);
+    const p = WTPacks.find(store.packs, serverPackId);
     if (p && !$('dlg-share').open && !$('screen-packs').classList.contains('hidden')) {
       openShareDialog(p, code);
     }
@@ -2000,6 +2065,12 @@
   function onUnshareError(message) {
     // 服务端已无此码（如其他设备先取消了）：重新拉取列表对账，让本机残留自行消失
     if (/分享码无效|不是这个分享的作者/.test(message)) requestMyShares();
+    toast(message);
+  }
+
+  // 下架失败（如别的设备已先下架）：重新拉取我的发布对账，让本机残留自行消失
+  function onPlazaUnpublishError(message) {
+    if (/没有这个词包|不是发布者/.test(message)) requestMyPlaza();
     toast(message);
   }
 
@@ -2073,6 +2144,9 @@
     store.packs = packs;
     $('err-pack-import').textContent = '';
     $('pack-import-code').value = '';
+    // 若导入的其实是自己在别的设备上分享的词包（来源 packId 已在「我的分享」里），
+    // 立即认领回稳定 id，徽标/更新/取消合流，不留在本机列表里当普通导入副本。
+    healAdoptedPacks();
     renderPacks();
     toast(`已导入词包「${pack.name}」，建房时可在大厅选用`);
   }
@@ -2160,7 +2234,13 @@
       return;
     }
     listEl.innerHTML = filtered.map(item => {
-      const subscribed = store.packs.some(p => p.plazaId === item.id);
+      // 已订阅（同一广场条目）直接显示已订阅；名称+候选词完全相同（如来自分享码导入
+      // 或自己另一份副本）也不再给订阅入口，避免跨来源重复订阅产生重复副本
+      const sameId = store.packs.some(p => p.plazaId === item.id);
+      const sameContent = !sameId && store.packs.some(p =>
+        p.name === item.name && JSON.stringify(p.words) === JSON.stringify(
+          Array.isArray(item.words) ? item.words : []));
+      const ownedHere = sameId || sameContent;
       // 列表带全部候选词（搜索可命中任意词），展示只取前几个做预览
       const words = Array.isArray(item.words) ? item.words : [];
       const preview = words.slice(0, WTPlaza.PREVIEW_WORDS);
@@ -2180,9 +2260,11 @@
         <div class="row">
           ${item.mine
             ? `<button class="link danger-link" data-plaza-unpub="${item.id}">下架</button>`
-            : subscribed
+            : sameId
               ? '<span class="badge plaza-subbed">已订阅</span>'
-              : `<button class="link" data-plaza-sub="${item.id}">订阅到本机</button>`}
+              : sameContent
+                ? '<span class="badge plaza-subbed">已在本机</span>'
+                : `<button class="link" data-plaza-sub="${item.id}">订阅到本机</button>`}
         </div>
       </li>`;
     }).join('');
@@ -2223,8 +2305,25 @@
     });
     if (error) return toast(error);
     store.packs = packs;
+    // 订阅到的若是自己在别的设备上发布的词包（条目 packId 已在「我的发布」里），
+    // 立即认领回稳定 id，徽标/更新/下架合流。
+    healAdoptedPacks();
     toast(`已订阅「${pack.name}」到本机，建房时可在大厅选用`);
     renderPlaza();
+  }
+
+  // 若本机词包是从自己的广场发布订阅来的副本（跨设备场景），找出它对应的条目 id：
+  // 更新发布时带上该 id，服务端覆盖同一条目（订阅数保留）而不是再发一条。
+  // 认领回稳定 id 后，本机映射已直接按 packId 对上，优先按 packId 找。
+  function ownPlazaIdForPack(p) {
+    if (!p) return '';
+    const byPackId = store.plazaMine.find(x => x.packId === p.id);
+    if (byPackId) return byPackId.id;
+    if (p.plazaId) {
+      const m = store.plazaMine.find(x => x.id === p.plazaId);
+      if (m) return m.id;
+    }
+    return '';
   }
 
   // 发布到广场（词包页「发布到广场 / 更新发布」）：一键发布，同一词包重复发布沿用原条目
@@ -2233,15 +2332,27 @@
     if (!send({
       type: 'plazaPublish', pidSecret: store.pidSecret, author: store.name,
       pack: { id: p.id, name: p.name, theme: p.theme, words: p.words },
+      id: ownPlazaIdForPack(p) || undefined,
     })) return;
     toast('正在发布到广场…');
   }
 
-  // 服务端确认发布成功（新建或更新）：记下本机映射，词包行出现"已发布"徽标
+  // 服务端确认发布成功（新建或更新）：记下本机映射，词包行出现"已发布"徽标。
+  // 条目 id 提示更新（跨设备）时服务端返回的 packId 是该条目原有的稳定作者 packId，
+  // 可能与本机新副本 id 不同：映射记到稳定 id，并把本机订阅副本认领/对齐到该 id。
   function onPlazaPublished(msg) {
     if (!WTPlaza.isValidPlazaId(msg.id)) return;
+    const serverPackId = String(msg.packId || '');
     store.plazaMine = WTPlaza.upsertLocal(store.plazaMine,
-      { id: msg.id, packId: msg.packId, name: msg.name, updatedAt: msg.updatedAt || Date.now() });
+      { id: msg.id, packId: serverPackId, name: msg.name, updatedAt: msg.updatedAt || Date.now() });
+    if (serverPackId && !WTPacks.find(store.packs, serverPackId)) {
+      const bySub = store.packs.find(p => p.plazaId === msg.id);
+      if (bySub) {
+        const r = WTPacks.adoptRemotePack(store.packs, 'plaza',
+          { matchId: msg.id, targetId: serverPackId });
+        if (r.changed) store.packs = r.packs;
+      }
+    }
     toast(msg.republished ? '广场上的词包已更新为最新内容' : `已发布到广场，大家都能搜索订阅「${msg.name}」了`);
     renderPacks();
   }
@@ -2271,6 +2382,7 @@
 
   function onMyPlaza(remote) {
     store.plazaMine = WTPlaza.reconcileLocal(store.plazaMine, remote);
+    if (healAdoptedPacks()) toast('已把另一台设备上的词包认领回本机');
     renderPacks();
   }
 
@@ -2350,9 +2462,12 @@
     }
     if (Object.keys(errors).length > 0) return;
     const wasEditing = !!editingPackId;
-    const { packs, error } = WTPacks.upsert(store.packs, {
+    // 编辑导入/订阅来的词包时保留来源标记：否则改过一个字就与来源脱钩，
+    // 同一来源能被再次导入/订阅成重复副本（新建时旧列表里没有，不继承任何标记）。
+    const nextPack = WTPacks.withPreservedProvenance(store.packs, {
       ...pack, id: editingPackId || WTPacks.makeId(), updatedAt: Date.now(),
     });
+    const { packs, error } = WTPacks.upsert(store.packs, nextPack);
     if (error) { $('err-pack-general').textContent = error; return; }
     store.packs = packs;
     closePackEditor();

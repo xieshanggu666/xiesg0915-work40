@@ -1177,6 +1177,8 @@ const handlers = {
 
   // 词包分享：作者把本机词包快照存到服务端并拿到 8 位分享码（同一词包重复点分享沿用原码、
   // 更新快照）。身份与赛季同一道凭据：只认密钥派生出的 pid，取消分享时据此确认是作者本人。
+  // msg.code 为可选的「更新本人已有码」提示：另一台设备导入了自己分享的词包后再更新，
+  // 带上原码即可覆盖同一条分享而不是分裂出第二个码（库内再校验码确实属于本人）。
   sharePack(ws, ctx, msg) {
     const { pid } = seasonLib.resolvePid(msg);
     if (!pid) return sendErr(ws, '需要有效的本机身份才能分享词包', 'sharePack');
@@ -1184,12 +1186,15 @@ const handlers = {
     if (typeof cleaned === 'string') return sendErr(ws, cleaned, 'sharePack');
     const result = sharesLib.publishForPack(shareStore, {
       pid, packId: cleaned.id, pack: cleaned, generate: makeShareCode,
+      code: msg.code,
     });
     if (result.error) return sendErr(ws, result.error, 'sharePack');
     saveShares();
     if (ws.readyState === 1) {
+      // 码提示更新时服务端保留了该码原 packId：回包里的 packId 以服务端实际条目为准，
+      // 客户端据此把本机映射（而非请求里的新副本 id）记到正确的稳定 id 上。
       ws.send(JSON.stringify({
-        type: 'shared', code: result.code, packId: cleaned.id,
+        type: 'shared', code: result.code, packId: result.packId || cleaned.id,
         name: cleaned.name, updatedAt: result.updatedAt, republished: result.updated,
       }));
     }
@@ -1235,6 +1240,8 @@ const handlers = {
 
   // 发布到广场：作者把本机词包快照公开到广场（同一词包重复发布沿用原条目、更新快照，
   // 订阅数保留）。身份与赛季/分享同一道凭据：只认密钥派生出的 pid。
+  // msg.id 为可选的「更新本人已有条目」提示：另一台设备订阅了自己发布的词包后再更新，
+  // 带上原条目 id 即覆盖同一条目而不是分裂出第二条（库内再校验条目确实属于本人）。
   plazaPublish(ws, ctx, msg) {
     const { pid } = seasonLib.resolvePid(msg);
     if (!pid) return sendErr(ws, '需要有效的本机身份才能发布到广场', 'plazaPublish');
@@ -1242,12 +1249,15 @@ const handlers = {
     if (typeof cleaned === 'string') return sendErr(ws, cleaned, 'plazaPublish');
     const result = plazaLib.publish(plazaStore, {
       pid, packId: cleaned.id, pack: cleaned, author: msg.author, generate: makePlazaId,
+      id: msg.id,
     });
     if (result.error) return sendErr(ws, result.error, 'plazaPublish');
     savePlaza();
     if (ws.readyState === 1) {
+      // 条目 id 提示更新时服务端保留了该条目原 packId：回包以服务端实际条目为准，
+      // 客户端据此把本机映射记到正确的稳定 id 上。
       ws.send(JSON.stringify({
-        type: 'plazaPublished', id: result.id, packId: cleaned.id,
+        type: 'plazaPublished', id: result.id, packId: result.packId || cleaned.id,
         name: cleaned.name, updatedAt: result.updatedAt, republished: result.republished,
       }));
     }

@@ -85,6 +85,52 @@ test('publish：新建发布；同一作者同一 packId 沿用原条目更新�
   assert.strictEqual(P.countByOwner(store, PID_A), 2);
 });
 
+test('publish：带本人有效条目 id 提示时覆盖同一条目、保留原 packId 与订阅数，不分裂第二条', () => {
+  const store = P.emptyPlaza();
+  // 设备 1 发布
+  const first = P.publish(store, {
+    pid: PID_A, packId: 'pk_orig', pack: validPack(), author: '甲',
+    now: 100, generate: genFrom(['pz_aaaaaaaaaaa1']),
+  });
+  P.subscribe(store, first.id, PID_B, 200);
+  // 设备 2：本机是订阅来的副本（新 id pk_copy），带原条目 id 更新发布
+  const r = P.publish(store, {
+    pid: PID_A, packId: 'pk_copy', id: first.id,
+    pack: validPack({ name: '跨设备更新' }), author: '甲', now: 300,
+    generate: genFrom(['pz_bbbbbbbbbbb2']),
+  });
+  assert.strictEqual(r.error, null);
+  assert.strictEqual(r.id, first.id, '沿用提示条目');
+  assert.strictEqual(r.republished, true);
+  assert.strictEqual(r.packId, 'pk_orig', '返回服务端实际条目 packId');
+  assert.strictEqual(P.countByOwner(store, PID_A), 1, '仍只有一条发布');
+  const e = P.getEntry(store, first.id);
+  assert.strictEqual(e.packId, 'pk_orig', '条目保留原作者 packId');
+  assert.strictEqual(e.pack.name, '跨设备更新', '快照被覆盖');
+  assert.strictEqual(P.subscriberCount(e), 1, '订阅数保留');
+});
+
+test('publish：条目 id 提示属于别人/不存在时忽略，按常规新条目处理（防劫持）', () => {
+  const store = P.emptyPlaza();
+  P.publish(store, {
+    pid: PID_A, packId: 'pk_a', pack: validPack({ name: '甲的包' }),
+    now: 1, generate: genFrom(['pz_aaaaaaaaaaa1']),
+  });
+  // B 试图借 id 提示覆盖 A 的条目
+  const hack = P.publish(store, {
+    pid: PID_B, packId: 'pk_b', id: 'pz_aaaaaaaaaaa1',
+    pack: validPack({ name: '攻击包' }), now: 2, generate: genFrom(['pz_bbbbbbbbbbb2']),
+  });
+  assert.strictEqual(hack.id, 'pz_bbbbbbbbbbb2', '提示被忽略，B 新建条目');
+  assert.strictEqual(P.getEntry(store, 'pz_aaaaaaaaaaa1').pack.name, '甲的包', 'A 的条目未被篡改');
+  // 不存在的条目 id 同样被忽略
+  const r = P.publish(store, {
+    pid: PID_B, packId: 'pk_b2', id: 'pz_ccccccccccc3',
+    pack: validPack(), now: 3, generate: genFrom(['pz_ccccccccccc3']),
+  });
+  assert.strictEqual(r.id, 'pz_ccccccccccc3');
+});
+
 test('publish：无身份/坏词包被拒；超过每人上限被拒；generate 撞 id 会重试', () => {
   const store = P.emptyPlaza();
   assert.match(P.publish(store, { pid: 'bad', packId: 'pk', pack: validPack() }).error, /身份/);
@@ -144,6 +190,12 @@ test('subscribe：同一身份只计一次热度；无身份不计数也能拿�
   assert.strictEqual(s3.counted, false, '无身份不计数');
   assert.strictEqual(s3.subscribers, 1);
   assert.ok(s3.pack.words.length >= 3, '仍能拿到词包');
+
+  // 作者本人订阅自己的发布：不抬高热度（仍能拿到词包）
+  const sSelf = P.subscribe(store, r.id, PID_A, 35);
+  assert.strictEqual(sSelf.counted, false, '作者自订阅不计热度');
+  assert.strictEqual(sSelf.subscribers, 1);
+  assert.ok(sSelf.pack, '作者仍能拿到词包快照');
 
   P.unpublish(store, r.id, PID_A);
   assert.match(P.subscribe(store, r.id, PID_C, 40).error, /下架/);

@@ -72,8 +72,60 @@
     return (Array.isArray(packs) ? packs : []).find(p => p.id === id) || null;
   }
 
+  // 本机词包可能带来源标记（importedFrom=分享码作者原始 packId；plazaId=广场条目 id）。
+  // 编辑器保存时只产出 {name,theme,words}，直接覆盖会把来源标记一起抹掉——抹掉后
+  // 同一来源可以被再次导入/订阅成重复副本。编辑已有词包时用这个函数把来源标记保留下来；
+  // 新建词包（原列表里没有）不继承任何标记。
+  function withPreservedProvenance(packs, next) {
+    const old = find(packs, next && next.id);
+    if (!old) return next;
+    const merged = { ...next };
+    if (old.importedFrom) merged.importedFrom = old.importedFrom;
+    if (old.importedAt) merged.importedAt = old.importedAt;
+    if (old.plazaId) merged.plazaId = old.plazaId;
+    if (old.subscribedAt) merged.subscribedAt = old.subscribedAt;
+    return merged;
+  }
+
+  // 跨设备认领（adopt）：本机有一份「从分享码导入 / 从广场订阅」来的副本
+  // （带 importedFrom / plazaId 来源标记），对账发现这个来源其实就是当前身份在
+  // 另一台设备上发布的——把本机副本的 id 改写为来源的稳定 id，让它与「我的分享/发布」
+  // 映射重新对上：徽标、沿用原码/原条目更新、取消/下架都合流，不再被当成两份东西。
+  //
+  // kind='share'：ref={matchId=作者原始 packId}，按 importedFrom 匹配，id 改写为 packId；
+  // kind='plaza'：ref={matchId=广场条目 id, targetId=作者原始 packId}，
+  //               按 plazaId 匹配，id 改写为 packId（广场徽标按 packId 对账）。
+  // 幂等：已认领过（本机 id 已是 targetId）返回 changed=false。
+  // 安全：若本机已存在 id===targetId 的另一份词包（极端 id 撞车/真身与副本并存），
+  //       不覆盖、不改写。
+  // 返回 { packs, adoptedId, changed }：changed 仅在真正发生 id 改写时为真。
+  function adoptRemotePack(packs, kind, ref) {
+    const list = Array.isArray(packs) ? packs.slice() : [];
+    const matchId = String((ref && ref.matchId) || '');
+    const targetId = String((ref && ref.targetId) || matchId);
+    if (!matchId || !targetId) return { packs: list, adoptedId: null, changed: false };
+    const existing = list.find(p => p.id === targetId);
+    if (existing) return { packs: list, adoptedId: targetId, changed: false };
+    const field = kind === 'plaza' ? 'plazaId' : 'importedFrom';
+    const idx = list.findIndex(p => p[field] === matchId);
+    if (idx < 0) return { packs: list, adoptedId: null, changed: false };
+    const adopted = { ...list[idx], id: targetId };
+    if (kind === 'share') {
+      // 认领回自己的分享：它不再是「导入副本」，清掉导入标记，避免对自己重复导入
+      delete adopted.importedFrom;
+      delete adopted.importedAt;
+    } else {
+      // 认领回自己的广场发布：本机副本即发布真身，订阅标记随之退场
+      delete adopted.plazaId;
+      delete adopted.subscribedAt;
+    }
+    list[idx] = adopted;
+    return { packs: list, adoptedId: targetId, changed: true };
+  }
+
   return {
     MAX_PACKS, MIN_WORDS, MAX_WORDS, MAX_NAME_LEN, MAX_THEME_LEN, MAX_WORD_LEN,
     parseWords, validatePack, makeId, upsert, remove, find,
+    withPreservedProvenance, adoptRemotePack,
   };
 });

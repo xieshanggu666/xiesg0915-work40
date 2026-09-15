@@ -112,6 +112,50 @@ test('publishForPack：不同作者同一 packId 各自独立成码', () => {
   assert.strictEqual(S.countByOwner(store, PID_B), 1);
 });
 
+test('publishForPack：带本人有效码提示时覆盖同一条分享、保留原 packId，不分裂出第二个码', () => {
+  const store = S.emptyShares();
+  let seq = 0;
+  const gen = () => ['PACK2222', 'PACK3333'][seq++];
+  // 设备 1：用 pk_orig 分享，拿到码 PACK2222
+  const first = S.publishForPack(store, { pid: PID_A, packId: 'pk_orig', pack: validPack(), generate: gen });
+  assert.strictEqual(first.code, 'PACK2222');
+  // 设备 2：本机副本 id 为 pk_copy（导入自己分享后的新 id），带上原码更新
+  const r = S.publishForPack(store, {
+    pid: PID_A, packId: 'pk_copy', code: 'PACK2222',
+    pack: validPack({ name: '跨设备更新' }), generate: gen,
+  });
+  assert.strictEqual(r.error, null);
+  assert.strictEqual(r.code, 'PACK2222', '沿用提示码，不生成新码');
+  assert.strictEqual(r.updated, true);
+  assert.strictEqual(r.packId, 'pk_orig', '返回服务端实际条目 packId');
+  assert.strictEqual(S.countByOwner(store, PID_A), 1, '仍只有一条分享');
+  const e = S.getShare(store, 'PACK2222');
+  assert.strictEqual(e.packId, 'pk_orig', '条目保留原作者 packId');
+  assert.strictEqual(e.pack.name, '跨设备更新', '快照被覆盖');
+});
+
+test('publishForPack：码提示属于别人 / 不存在时忽略，按常规新分享处理（防劫持）', () => {
+  const store = S.emptyShares();
+  let seq = 0;
+  const gen = () => ['AAAA2222', 'BBBB3333'][seq++];
+  // A 已有一条分享
+  S.publishForPack(store, { pid: PID_A, packId: 'pk_a', pack: validPack(), generate: gen });
+  // B 试图用 A 的码作为提示：绝不允许覆盖 A 的分享
+  const hack = S.publishForPack(store, {
+    pid: PID_B, packId: 'pk_b', code: 'AAAA2222', pack: validPack({ name: '攻击包' }), generate: gen,
+  });
+  assert.strictEqual(hack.code, 'BBBB3333', '提示被忽略，B 走全新发码');
+  assert.strictEqual(S.getShare(store, 'AAAA2222').pack.name, '海洋奇缘', 'A 的快照未被篡改');
+  // 不存在的码提示同样被忽略
+  let n = 0;
+  const r = S.publishForPack(store, {
+    pid: PID_B, packId: 'pk_b2', code: 'ZZZZ9999', pack: validPack(),
+    generate: () => 'CCCC4444',
+  });
+  assert.strictEqual(r.code, 'CCCC4444');
+  assert.strictEqual(n, 0);
+});
+
 test('publishForPack：每人分享数到上限拒绝新建，但更新已有分享不受限', () => {
   const store = S.emptyShares();
   let n = 0;

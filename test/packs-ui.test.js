@@ -405,3 +405,78 @@ test('进入词包页即向服务端拉取我的分享列表', () => {
   $('btn-packs-home').onclick();
   assert.strictEqual(sentMsgs.filter(m => m.type === 'myShares').length, before + 1);
 });
+
+test('编辑导入来的词包后来源标记保留，同一来源不会被重复导入成第二份', () => {
+  // 先模拟一次成功导入（带来源标记）
+  $('btn-packs-home').onclick();
+  recvMsg({ type: 'sharedPack', code: 'KKKKMNPQ',
+    pack: { id: 'pk_provenance_src', name: '来源包', theme: 't', words: ['甲', '乙', '丙'] } });
+  const before = storedPacks();
+  assert.strictEqual(before.filter(p => p.importedFrom === 'pk_provenance_src').length, 1);
+  const local = before.find(p => p.importedFrom === 'pk_provenance_src');
+
+  // 编辑这个词包（改名 + 换一个候选词）并保存
+  $('pack-list').querySelectorAll('[data-pack-edit]')
+    .find(b => b.dataset.packEdit === local.id).onclick();
+  $('pack-name').value = '来源包改';
+  $('pack-words').value = '甲\n乙\n丁';
+  $('btn-pack-save').onclick();
+  const edited = storedPacks().find(p => p.id === local.id);
+  assert.strictEqual(edited.importedFrom, 'pk_provenance_src', '编辑后来源标记保留');
+  assert.deepStrictEqual(edited.words, ['甲', '乙', '丁']);
+
+  // 再次导入同一来源：仍按来源去重，不产生第二份副本
+  $('pack-import-code').value = 'KKKKMNPQ';
+  $('btn-pack-import').onclick();
+  recvMsg({ type: 'sharedPack', code: 'KKKKMNPQ',
+    pack: { id: 'pk_provenance_src', name: '来源包改', theme: 't', words: ['甲', '乙', '丁'] } });
+  assert.strictEqual(storedPacks().filter(p => p.importedFrom === 'pk_provenance_src').length, 1,
+    '编辑后同一来源仍被去重');
+});
+
+test('跨设备认领：导入自己在另一台设备上分享的词包，对账后本机副本 id 认领回稳定 packId', () => {
+  $('btn-packs-home').onclick();
+  const packsBefore = storedPacks().length;
+  // 通过分享码导入（此时还不知道是自己的）：生成本机副本 id、带 importedFrom
+  recvMsg({ type: 'sharedPack', code: 'MMMM2222',
+    pack: { id: 'pk_dev2_origin', name: '另一台设备的包', theme: '', words: ['甲', '乙', '丙'] } });
+  const local = storedPacks().find(p => p.importedFrom === 'pk_dev2_origin');
+  assert.ok(local, '导入成功，带 importedFrom 标记');
+  assert.notStrictEqual(local.id, 'pk_dev2_origin');
+
+  // 服务端 myShares 对账：发现该 packId 就是当前身份（同一 pidSecret）在另一台设备上分享的
+  recvMsg({ type: 'myShares', shares: [
+    { code: 'MMMM2222', packId: 'pk_dev2_origin', name: '另一台设备的包', updatedAt: 100 },
+  ] });
+  const after = storedPacks();
+  const adopted = after.find(p => p.id === 'pk_dev2_origin');
+  assert.ok(adopted, '本机副本 id 被认领回来源稳定 packId');
+  assert.ok(!adopted.importedFrom, '认领后不再带导入标记');
+  assert.strictEqual(after.length, packsBefore + 1, '不产生重复词包');
+  // 认领后不再出现在「其他设备」孤儿区（本机已能按稳定 id 对上）
+  assert.ok($('shared-orphans')._cls.has('hidden'), '孤儿区隐藏');
+  // 列表里该词包直接显示分享码徽标
+  assert.ok($('pack-list').innerHTML.includes('MMMM-2222'));
+
+  // 再次对账幂等：不报错、不重复
+  recvMsg({ type: 'myShares', shares: [
+    { code: 'MMMM2222', packId: 'pk_dev2_origin', name: '另一台设备的包', updatedAt: 100 },
+  ] });
+  assert.strictEqual(storedPacks().length, packsBefore + 1);
+});
+
+test('跨设备认领安全：本机已存在同 id 真身时不覆盖，仅按原状保留', () => {
+  $('btn-packs-home').onclick();
+  // 极端情形：本机同时有真身与导入副本
+  storage.wt_packs = JSON.stringify([
+    { id: 'pk_real', name: '真身', theme: '', words: ['甲', '乙', '丙'], updatedAt: 1 },
+    { id: 'pk_copy', name: '副本', theme: '', words: ['甲', '乙', '丙'],
+      importedFrom: 'pk_real', importedAt: 2, updatedAt: 2 },
+  ]);
+  recvMsg({ type: 'myShares', shares: [
+    { code: 'NNNN3333', packId: 'pk_real', name: '真身', updatedAt: 100 },
+  ] });
+  const packs = storedPacks();
+  assert.strictEqual(packs.length, 2, '两份词包原样保留');
+  assert.strictEqual(packs.find(p => p.id === 'pk_copy').importedFrom, 'pk_real', '副本未被改写');
+});
